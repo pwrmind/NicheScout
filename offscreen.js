@@ -54,16 +54,25 @@ async function handleEmbeddings(message) {
     await initModel();
     const { query, products } = message.data;
 
-    const qOutput = await extractor(query, { pooling: 'mean', normalize: true });
+    // 1. Готовим запрос
+    const qOutput = await extractor(`query: ${query}`, { pooling: 'mean', normalize: true });
     const qVec = Array.from(qOutput.data);
 
-    const results = [];
-    for (const product of products) {
-      const pOutput = await extractor(product.text, { pooling: 'mean', normalize: true });
-      const pVec = Array.from(pOutput.data);
+    // 2. Готовим массив текстов товаров с префиксами
+    const passages = products.map(p => `passage: ${p.text}`);
+
+    // 3. Batch-обработка: получаем эмбеддинги для всех товаров сразу
+    const pOutputs = await extractor(passages, { pooling: 'mean', normalize: true });
+
+    // 4. Расчет скоров
+    // pOutputs.tolist() возвращает массив векторов (по одному на каждый товар)
+    const pVectors = pOutputs.tolist(); 
+
+    const results = products.map((product, index) => {
+      const pVec = pVectors[index];
       const score = Transformers.cos_sim(qVec, pVec);
-      results.push({ id: product.id, score });
-    }
+      return { id: product.id, score };
+    });
 
     chrome.runtime.sendMessage({
       type: 'MATCHING_RESULTS',
