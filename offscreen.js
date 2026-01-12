@@ -1,89 +1,153 @@
 import * as Transformers from './lib/transformers.min.js';
 
-console.log(Transformers); // Проверьте, есть ли здесь cosine_similarity
-debugger;
+console.log("Transformers loaded:", Transformers);
+
+// Проверяем доступность методов
+if (!Transformers.cos_sim && Transformers.cosine_similarity) {
+  Transformers.cos_sim = Transformers.cosine_similarity;
+}
+if (!Transformers.cos_sim) {
+  console.error("cos_sim/cosine_similarity not found in Transformers!");
+}
+
 Transformers.env.allowLocalModels = false;
 Transformers.env.useBrowserCache = true;
-
-// Указываем путь к ресурсам ONNX Runtime, если они блокируются
-// Явно указываем пути к WASM модулям на CDN
-// const DIST_URL = 'cdn.jsdelivr.net';
-// Transformers.env.backends.onnx.wasm.wasmPaths = DIST_URL;
 
 const libPath = chrome.runtime.getURL('lib/');
 Transformers.env.backends.onnx.wasm.wasmPaths = libPath;
 
-let extractor;
+let extractor = null;
+let isInitializing = false;
+let initPromise = null;
 
 async function initModel() {
-  if (!extractor) {
-    console.log("Инициализация модели...");
+  if (extractor) return extractor;
+  if (isInitializing) {
+    return initPromise;
+  }
+  
+  isInitializing = true;
+  console.log("Инициализация модели...");
+  
+  initPromise = (async () => {
     try {
-      // Пытаемся запустить через WebGPU
+      // Попытка WebGPU
       extractor = await Transformers.pipeline('feature-extraction', 'Xenova/multilingual-e5-small', {
         device: 'webgpu',
-        dtype: 'fp32' // Явно указываем тип данных, чтобы убрать предупреждение
+        dtype: 'fp32'
       });
       console.log("Модель загружена: WebGPU");
     } catch (err) {
-      console.warn("WebGPU не удался, пробуем WASM...", err);
-      // Резервный вариант через WASM
+      console.warn("WebGPU failed, trying WASM...", err);
+      
+      // Резерв: WASM
       extractor = await Transformers.pipeline('feature-extraction', 'Xenova/multilingual-e5-small', {
         device: 'wasm',
-        dtype: 'q8' // Оптимизированный формат для процессора
+        dtype: 'q8'
       });
       console.log("Модель загружена: WASM");
     }
-  }
+    
+    isInitializing = false;
+    return extractor;
+  })();
+  
+  return initPromise;
 }
 
+// Сразу инициализируем модель при загрузке
+initModel().then(() => {
+  console.log("Модель инициализирована, отправляем READY");
+  chrome.runtime.sendMessage({ type: 'OFFSCREEN_READY' });
+}).catch(err => {
+  console.error("Model initialization failed:", err);
+});
 
-// Слушаем сообщения
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  // Игнорируем сообщения, не предназначенные нам
   if (message.target !== 'offscreen') return;
-
+  
   if (message.type === 'COMPUTE_EMBEDDINGS') {
     handleEmbeddings(message);
-    return true; // Держим канал открытым
+    return true;
   }
 });
 
 async function handleEmbeddings(message) {
   try {
+    console.log("Processing embeddings for query:", message.data.query.substring(0, 50));
+    
     await initModel();
     const { query, products } = message.data;
-
-    // 1. Готовим запрос
-    const qOutput = await extractor(`query: ${query}`, { pooling: 'mean', normalize: true });
-    const qVec = Array.from(qOutput.data);
-
-    // 2. Готовим массив текстов товаров с префиксами
-    const passages = products.map(p => `passage: ${p.text}`);
-
-    // 3. Batch-обработка: получаем эмбеддинги для всех товаров сразу
-    const pOutputs = await extractor(passages, { pooling: 'mean', normalize: true });
-
-    // 4. Расчет скоров
-    // pOutputs.tolist() возвращает массив векторов (по одному на каждый товар)
-    const pVectors = pOutputs.tolist(); 
-
-    const results = products.map((product, index) => {
-      const pVec = pVectors[index];
-      const score = Transformers.cos_sim(qVec, pVec);
-      return { id: product.id, score };
+    
+    if (!extractor) {
+      throw new Error("Extractor not initialized");
+    }
+    
+    // 1. Эмбеддинг запроса
+    const qOutput = await extractor(`query: ${query}`, { 
+      pooling: 'mean', 
+      normalize: true 
     });
-
+    const qVec = Array.from(qOutput.data);
+    
+    // 2. Эмбеддинги товаров (батчем)
+    const passages = products.map(p => `passage: ${p.text}`);
+    const pOutputs = await extractor(passages, { 
+      pooling: 'mean', 
+      normalize: true 
+    });
+    
+    // 3. Расчет косинусного сходства
+    const pVectors = pOutputs.tolist();
+    const results = [];
+    
+    for (let i = 0; i < products.length; i++) {
+      const pVec = pVectors[i];
+      let score = 0;
+      
+      try {
+        // Проверяем разные варианты названия функции
+        if (Transformers.cos_sim) {
+          score = Transformers.cos_sim(qVec, pVec);
+        } else if (Transformers.cosine_similarity) {
+          score = Transformers.cosine_similarity(qVec, pVec);
+        } else {
+          // Ручной расчет
+          const dotProduct = qVec.reduce((sum, val, idx) => sum + val * pVec[idx], 0);
+          const qNorm = Math.sqrt(qVec.reduce((sum, val) => sum + val * val, 0));
+          const pNorm = Math.sqrt(pVec.reduce((sum, val) => sum + val * val, 0));
+          score = dotProduct / (qNorm * pNorm);
+        }
+      } catch (err) {
+        console.error("Error calculating similarity:", err);
+        score = 0;
+      }
+      
+      // Если score - это объект (например, тензор), извлекаем значение
+      if (score && typeof score === 'object' && 'item' in score) {
+        score = score.item();
+      }
+      
+      results.push({ 
+        id: products[i].id, 
+        score: typeof score === 'number' ? score : 0
+      });
+    }
+    
+    console.log("Sending results for tab:", message.tabId);
     chrome.runtime.sendMessage({
       type: 'MATCHING_RESULTS',
       results: results,
       tabId: message.tabId
     });
+    
   } catch (error) {
-    console.error("AI Error:", error);
+    console.error("AI Error in handleEmbeddings:", error);
+    // Отправляем пустые результаты в случае ошибки
+    chrome.runtime.sendMessage({
+      type: 'MATCHING_RESULTS',
+      results: message.data.products.map(p => ({ id: p.id, score: 0 })),
+      tabId: message.tabId
+    });
   }
 }
-
-// СИГНАЛ ГОТОВНОСТИ: Сообщаем background.js, что мы загрузились
-chrome.runtime.sendMessage({ type: 'OFFSCREEN_READY' });
-

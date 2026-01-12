@@ -17,11 +17,11 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["lib/transformers.min.js"],
+      "resources": ["lib/transformers.min.js", "lib/*.wasm"],
       "matches": ["<all_urls>"]
     },
     {
-      "resources": ["offscreen.html"],
+      "resources": ["offscreen.html", "offscreen.js"],
       "matches": ["<all_urls>"]
     }
   ],
